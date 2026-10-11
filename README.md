@@ -409,3 +409,7 @@ anywhere that contains agent-sandbox's state folder.
     docker volume rm agent-sandbox-home         # forget the other coding agents' settings
     docker volume rm agent-sandbox-hermes-data  # forget Hermes's memory, skills and config
     docker rmi agent-sandbox:latest agent-sandbox-hermes:latest
+
+## License
+
+MIT. See `LICENSE`.
