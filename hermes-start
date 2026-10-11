@@ -1,0 +1,73 @@
+#!/bin/bash
+# Runs as the hermes user. Points Hermes at its model, then starts it.
+# HERMES_BRAIN picks the model: "local" is the host model server, "claude"
+# is Anthropic's API. These settings win over whatever is in Hermes's config.
+set -euo pipefail
+
+# The coding agents Hermes can delegate to are also reachable directly, for
+# example to sign Claude Code in once: `agent-sandbox hermes claude`.
+case "${1:-}" in
+    claude | claude-local | opencode | bash | sh) exec "$@" ;;
+esac
+
+# Skills baked into the image, read-only to Hermes. Registered once; this
+# replaces any external_dirs already in the config.
+# The second folder is the global skills folder shared by every sandbox,
+# which the launcher mounts where Claude Code and OpenCode also look.
+skills_dirs='["/usr/local/share/agent-sandbox/skills", "/opt/data/.claude/skills"]'
+skills_stamp="$HERMES_HOME/.sandbox-skills"
+if [ "$(cat "$skills_stamp" 2>/dev/null || true)" != "$skills_dirs" ]; then
+    hermes config set skills.external_dirs "$skills_dirs" >/dev/null
+    printf '%s' "$skills_dirs" > "$skills_stamp"
+fi
+
+base_url="http://$MODEL_HOST:$MODEL_PORT/v1"
+brain="${HERMES_BRAIN:-local}"
+case "$brain" in
+    local) wanted="local|$MODEL_NAME|$base_url|${MODEL_API_KEY:-local}|$MODEL_CONTEXT" ;;
+    claude) wanted="claude|$HERMES_CLAUDE_MODEL" ;;
+    *)
+        echo "[sandbox] unknown HERMES_BRAIN '$brain' (expected local or claude)" >&2
+        exit 1
+        ;;
+esac
+stamp="$HERMES_HOME/.sandbox-model"
+
+# Each `hermes config` call takes a moment, so only write when something changed.
+if [ "$(cat "$stamp" 2>/dev/null || true)" != "$wanted" ]; then
+    if [ "$brain" = claude ]; then
+        hermes config set model.provider anthropic >/dev/null
+        hermes config set model.default "$HERMES_CLAUDE_MODEL" >/dev/null
+        # Left over from local mode; without them Hermes uses Anthropic's defaults.
+        for key in base_url api_key context_length; do
+            hermes config unset "model.$key" >/dev/null 2>&1 || true
+        done
+    else
+        hermes config set model.provider custom >/dev/null
+        hermes config set model.default "$MODEL_NAME" >/dev/null
+        hermes config set model.base_url "$base_url" >/dev/null
+        hermes config set model.api_key "${MODEL_API_KEY:-local}" >/dev/null
+        hermes config set model.context_length "$MODEL_CONTEXT" >/dev/null
+    fi
+    (umask 077 && printf '%s' "$wanted" > "$stamp")
+fi
+
+# Give Hermes the note about this sandbox on every turn. This setting replaces
+# the personality or system prompt set in Hermes's own config, so that text is
+# looked up and kept in front of the note.
+own_prompt="$(/opt/hermes/.venv/bin/python - <<'PY' 2>/dev/null || true
+from hermes_cli.config import load_config
+from hermes_cli.personality import resolve_ephemeral_system_prompt
+print(resolve_ephemeral_system_prompt(load_config()) or "")
+PY
+)"
+HERMES_EPHEMERAL_SYSTEM_PROMPT="${own_prompt:+$own_prompt
+
+}$(cat /etc/agent-sandbox/SANDBOX.md)"
+export HERMES_EPHEMERAL_SYSTEM_PROMPT
+
+if [ "$brain" = claude ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+    echo "[sandbox] HERMES_ANTHROPIC_API_KEY is not set in sandbox.env; Hermes will use any Anthropic credentials it already holds" >&2
+fi
+
+exec hermes "$@"

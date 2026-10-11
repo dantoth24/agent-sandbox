@@ -1,0 +1,39 @@
+# Hermes Agent, wrapped with the same network lockdown as the coding image.
+# Built on the official image so Hermes itself is installed the way its
+# maintainers ship it.
+ARG HERMES_VERSION=latest
+FROM nousresearch/hermes-agent:${HERMES_VERSION}
+
+ARG CLAUDE_CODE_VERSION=latest
+ARG OPENCODE_VERSION=latest
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends iproute2 iptables jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# The coding agents Hermes's bundled skills delegate to. Root-owned and
+# outside the data volume, so they cannot update themselves.
+# AGENTS_REFRESH is set to a new value by every `agent-sandbox build`, so this
+# step is not served from cache and the agents are reinstalled.
+ARG AGENTS_REFRESH=0
+RUN echo "agents refresh ${AGENTS_REFRESH}" && npm install -g --prefix /usr/local \
+        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+        "opencode-ai@${OPENCODE_VERSION}" \
+    && npm cache clean --force
+
+COPY network.sh agents.sh /usr/local/lib/agent-sandbox/
+# Extra skills for Hermes, registered as a read-only external skill folder.
+COPY hermes-skills/ /usr/local/share/agent-sandbox/skills/
+COPY hermes-entrypoint.sh hermes-start claude-local /usr/local/bin/
+RUN chmod 755 /usr/local/bin/hermes-entrypoint.sh /usr/local/bin/hermes-start /usr/local/bin/claude-local
+
+# S6_VERBOSITY: only errors from the image's init system. Level 1 also prints
+# a harmless "marked as essential, not stopping it" warning on every exit.
+# The other two keep Claude Code from making background requests.
+ENV S6_VERBOSITY=0 \
+    DISABLE_AUTOUPDATER=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+ENTRYPOINT ["/usr/local/bin/hermes-entrypoint.sh"]
+CMD ["hermes-start"]

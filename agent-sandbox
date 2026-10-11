@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+# Run a coding agent in a container that sees only the current project.
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$SELF" 2>/dev/null || echo "$SELF")")" && pwd -P)"
+
+if [ -f "$SCRIPT_DIR/sandbox.env" ]; then
+    # shellcheck source=sandbox.env
+    . "$SCRIPT_DIR/sandbox.env"
+fi
+
+IMAGE="${AGENT_SANDBOX_IMAGE:-agent-sandbox:latest}"
+HOME_VOLUME="${AGENT_SANDBOX_HOME_VOLUME:-agent-sandbox-home}"
+CLAUDE_VOLUME="${AGENT_SANDBOX_CLAUDE_VOLUME:-agent-sandbox-claude}"
+HERMES_IMAGE="${AGENT_SANDBOX_HERMES_IMAGE:-agent-sandbox-hermes:latest}"
+HERMES_VOLUME="${AGENT_SANDBOX_HERMES_VOLUME:-agent-sandbox-hermes-data}"
+STATE_DIR="${AGENT_SANDBOX_STATE_DIR:-$HOME/.local/state/agent-sandbox}"
+SKILLS_DIR="${AGENT_SANDBOX_SKILLS_DIR:-$STATE_DIR/skills}"
+ALLOWLIST="${AGENT_SANDBOX_ALLOWLIST:-$SCRIPT_DIR/allowed-domains.txt}"
+MODEL_HOST="${MODEL_HOST:-host.docker.internal}"
+MODEL_PORT="${MODEL_PORT:-8080}"
+MODEL_NAME="${MODEL_NAME:-local}"
+MODEL_CONTEXT="${MODEL_CONTEXT:-131072}"
+MODEL_API_KEY="${MODEL_API_KEY:-}"
+HERMES_CLAUDE_MODEL="${HERMES_CLAUDE_MODEL:-claude-opus-5-5}"
+HERMES_ANTHROPIC_API_KEY="${HERMES_ANTHROPIC_API_KEY:-}"
+PROXY_PORT="${PROXY_PORT:-8877}"
+PROXY_PROMPT="${PROXY_PROMPT:-1}"
+SANDBOX_NETWORK="${SANDBOX_NETWORK:-restricted}"
+DRY_RUN="${AGENT_SANDBOX_DRY_RUN:-}"
+
+usage() {
+    cat <<'EOF'
+Usage: agent-sandbox [--write-skills] <command> [args...]
+
+Run from the project directory you want the agent to work in.
+
+  opencode [args]         OpenCode on the local model
+  claude [args]           Claude Code on Anthropic's API
+  claude-local [args]     Claude Code on the local model
+  oterm [args]            oterm, a terminal chat client, on the local model
+  hermes [args]           Hermes Agent on the local model
+  hermes-claude [args]    Hermes Agent on Anthropic's API
+  shell                   A shell inside the coding sandbox (no sign-ins or history)
+  build                   Build or rebuild both images
+
+Folders beyond the project that a sandbox started here may use. Changes
+apply the next time a sandbox starts in the project:
+
+  folders                 Show them
+  folders add PATH        Let agents read PATH; add --write to let them change it
+  folders remove PATH     Take it away again
+
+Skills shared by every sandbox and every project. Agents can read them but
+not change them, unless the sandbox is started with --write-skills:
+
+  skills                  List them, and show where they are kept
+  --write-skills COMMAND  Start COMMAND with the skills folder writable
+
+MCP servers that run on this Mac, listed in mcp-servers.conf. These run
+outside the sandboxes and are not reachable from them:
+
+  mcp                     Show which are running
+  mcp start|stop|restart|log NAME
+
+Conversation history kept for the project in the current directory:
+
+  history                 Show what each agent has stored, and where
+  history clear           Delete it, after asking (--yes skips the question)
+
+Web access from the sandbox goes through an approval proxy on the host.
+These act on the project in the current directory; add --global to act on
+the rules shared by every project:
+
+  rules                   Show this project's rules and the global ones
+  rules clear             Delete this project's rules, after asking
+  allow DOMAIN [TIME]     Allow a domain, optionally for 30m, 1h, 2d, ...
+  block DOMAIN            Always refuse a domain, without asking
+  remove DOMAIN           Forget a domain's rule, so it asks again
+  remove --expired        Clear out rules whose time has run out
+  proxy start|stop|status|log
+
+Settings live in sandbox.env, global rules in allowed-domains.txt next to
+it. Set AGENT_SANDBOX_DRY_RUN=1 to print the docker command instead of
+running it.
+EOF
+}
+
+die() {
+    echo "agent-sandbox: $*" >&2
+    exit 1
+}
+
+require_docker() {
+    [ -n "$DRY_RUN" ] && return 0
+    docker info >/dev/null 2>&1 ||
+        die "cannot reach a Docker engine. Start Rancher Desktop with the dockerd (moby) engine, then check 'docker context ls'."
+}
+
+build_image() {
+    docker build \
+        --build-arg "AGENT_UID=$(id -u)" \
+        --build-arg "AGENT_GID=$(id -g)" \
+        --build-arg "AGENTS_REFRESH=$(date +%s)" \
+        -t "$IMAGE" "$SCRIPT_DIR"
+}
+
+build_hermes_image() {
+    docker build --pull --build-arg "AGENTS_REFRESH=$(date +%s)" \
+        -f "$SCRIPT_DIR/Dockerfile.hermes" -t "$HERMES_IMAGE" "$SCRIPT_DIR"
+}
+
+rules() {
+    python3 "$SCRIPT_DIR/proxy.py" --allowlist "$ALLOWLIST" --state-dir "$STATE_DIR" "$@"
+}
+
+project_data() {
+    python3 "$SCRIPT_DIR/projectdata.py" --allowlist "$ALLOWLIST" --state-dir "$STATE_DIR" \
+        --project "$(pwd -P)" "$@"
+}
+
+# Prints "agent-sandbox-proxy <version>" when a proxy answers on the port.
+proxy_health() {
+    curl -s --noproxy '*' --max-time 2 "http://127.0.0.1:$PROXY_PORT/health" 2>/dev/null || true
+}
+
+proxy_running() {
+    proxy_health | grep -q '^agent-sandbox-proxy'
+}
+
+# The proxy runs on the host, outside every sandbox, and keeps running after
+# the sandbox that started it exits. One left over from an older proxy.py is
+# replaced; running sandboxes reconnect to the new one.
+start_proxy() {
+    local wanted health
+    wanted="agent-sandbox-proxy $(shasum -a 256 "$SCRIPT_DIR/proxy.py" | cut -c1-12)"
+    health="$(proxy_health)"
+    [ "$health" = "$wanted" ] && return 0
+    if [ -n "$health" ]; then
+        stop_proxy >/dev/null
+        sleep 0.5
+        proxy_running && die "a different proxy is using port $PROXY_PORT; stop it and try again"
+    fi
+    mkdir -p "$STATE_DIR"
+    local prompt_flag=""
+    [ "$PROXY_PROMPT" = 0 ] && prompt_flag="--no-prompt"
+    # shellcheck disable=SC2086
+    nohup python3 "$SCRIPT_DIR/proxy.py" --allowlist "$ALLOWLIST" --state-dir "$STATE_DIR" serve \
+        --port "$PROXY_PORT" --log "$STATE_DIR/proxy.log" $prompt_flag \
+        >>"$STATE_DIR/proxy.log" 2>&1 &
+    echo $! >"$STATE_DIR/proxy.pid"
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        [ "$(proxy_health)" = "$wanted" ] && return 0
+        sleep 0.5
+    done
+    die "the approval proxy did not start; see $STATE_DIR/proxy.log"
+}
+
+stop_proxy() {
+    local pid
+    pid="$(cat "$STATE_DIR/proxy.pid" 2>/dev/null || true)"
+    if [ -n "$pid" ] && ps -p "$pid" -o command= 2>/dev/null | grep -q "proxy.py"; then
+        kill "$pid"
+        echo "proxy stopped"
+    else
+        echo "proxy was not running"
+    fi
+    rm -f "$STATE_DIR/proxy.pid"
+}
+
+# Each sandbox gets a token that tells the proxy which project it belongs to.
+# Tokens of sandboxes that are no longer running are cleared out here.
+register_sandbox() {
+    local folder="$STATE_DIR/sandboxes" running file
+    mkdir -p "$folder"
+    running="$(docker ps --format '{{.Names}}' 2>/dev/null || true)"
+    for file in "$folder"/*; do
+        [ -f "$file" ] || continue
+        printf '%s\n' "$running" | grep -qxF "$(sed -n 2p "$file")" || rm -f "$file"
+    done
+    PROXY_TOKEN="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    (umask 077 && printf '%s\n%s\n' "$WORKSPACE" "$name" >"$folder/$PROXY_TOKEN")
+    export PROXY_TOKEN
+}
+
+# Options for the launcher itself come before the command.
+write_skills=""
+while [ $# -ge 1 ]; do
+    case "$1" in
+        --write-skills) write_skills=1 ;;
+        *) break ;;
+    esac
+    shift
+done
+
+[ $# -ge 1 ] || { usage; exit 1; }
+sub="$1"
+shift
+
+image="$IMAGE"
+case "$sub" in
+    opencode) cmd=(opencode "$@") ;;
+    claude) cmd=(claude "$@") ;;
+    claude-local) cmd=(claude-local "$@") ;;
+    oterm) cmd=(oterm-start "$@") ;;
+    shell) cmd=(bash "$@") ;;
+    hermes | hermes-claude)
+        cmd=(hermes-start "$@")
+        image="$HERMES_IMAGE"
+        ;;
+    build)
+        require_docker
+        build_image
+        build_hermes_image
+        exit 0
+        ;;
+    allow | block | remove)
+        [ $# -ge 1 ] || die "usage: agent-sandbox $sub DOMAIN [--global]"
+        rules --project "$(pwd -P)" "$sub" "$@"
+        exit
+        ;;
+    rules | list)
+        case "${1:-}" in
+            "") rules --project "$(pwd -P)" list ;;
+            clear) shift; project_data rules-clear "$@" ;;
+            *) die "usage: agent-sandbox rules [clear [--yes]]" ;;
+        esac
+        exit
+        ;;
+    history)
+        project_data history "$@"
+        exit
+        ;;
+    folders)
+        project_data folders "$@"
+        exit
+        ;;
+    skills)
+        project_data skills --skills-dir "$SKILLS_DIR"
+        exit
+        ;;
+    mcp)
+        python3 "$SCRIPT_DIR/mcpservers.py" --config "$SCRIPT_DIR/mcp-servers.conf" \
+            --state-dir "$STATE_DIR/mcp" "$@"
+        exit
+        ;;
+    proxy)
+        case "${1:-status}" in
+            start) start_proxy && echo "proxy running on 127.0.0.1:$PROXY_PORT" ;;
+            stop) stop_proxy ;;
+            status)
+                if proxy_running; then
+                    echo "proxy running on 127.0.0.1:$PROXY_PORT"
+                else
+                    echo "proxy not running"
+                fi
+                ;;
+            log) tail -n 40 "$STATE_DIR/proxy.log" ;;
+            *) die "usage: agent-sandbox proxy start|stop|status|log" ;;
+        esac
+        exit 0
+        ;;
+    -h | --help | help)
+        usage
+        exit 0
+        ;;
+    *)
+        usage >&2
+        exit 1
+        ;;
+esac
+
+WORKSPACE="$(pwd -P)"
+HOME_REAL="$(cd "$HOME" && pwd -P)"
+
+[ "$WORKSPACE" = / ] && die "refusing to mount /. cd into a project first."
+case "$HOME_REAL/" in
+    "$WORKSPACE"/*) die "refusing to mount $WORKSPACE: it contains your whole home directory. cd into a project first." ;;
+esac
+case "$WORKSPACE/" in
+    "$SCRIPT_DIR"/*) die "refusing to mount the sandbox's own files writable. cd into a project first." ;;
+esac
+# The state folder holds every project's rules and history.
+case "$STATE_DIR/" in
+    "$WORKSPACE"/*) die "refusing to mount $WORKSPACE: it contains agent-sandbox's own rules and history." ;;
+esac
+case "$WORKSPACE/" in
+    "$STATE_DIR"/*) die "refusing to mount agent-sandbox's own rules and history." ;;
+esac
+
+name="agent-sandbox-$(basename "$WORKSPACE" | tr -cs 'A-Za-z0-9_.-' '-')$$"
+
+require_docker
+if [ -z "$DRY_RUN" ]; then
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        if [ "$image" = "$HERMES_IMAGE" ]; then build_hermes_image; else build_image; fi
+    fi
+    if [ "$SANDBOX_NETWORK" = restricted ]; then
+        start_proxy
+        register_sandbox
+    fi
+fi
+
+run_args=(
+    run --rm
+    --name "$name"
+    --hostname agent-sandbox
+    # Needed by the entrypoint to set the firewall; the agent itself runs
+    # as an unprivileged user with no capabilities.
+    --cap-add NET_ADMIN --cap-add NET_RAW
+    --pids-limit 4096
+    -e "MODEL_HOST=$MODEL_HOST"
+    -e "MODEL_PORT=$MODEL_PORT"
+    -e "MODEL_NAME=$MODEL_NAME"
+    -e "MODEL_CONTEXT=$MODEL_CONTEXT"
+    # Keys are passed by name so their values stay out of the process list.
+    -e MODEL_API_KEY
+    -e PROXY_TOKEN
+    -e "PROXY_PORT=$PROXY_PORT"
+    -e "SANDBOX_NETWORK=$SANDBOX_NETWORK"
+    -e "TERM=${TERM:-xterm-256color}"
+    -e COLORTERM
+    -v "$WORKSPACE:$WORKSPACE"
+    -w "$WORKSPACE"
+)
+
+export MODEL_API_KEY
+
+# Global skills, shared by every sandbox. Claude Code and OpenCode both read
+# ~/.claude/skills, and Hermes is pointed at the same folder. Read-only
+# unless this sandbox was started with --write-skills: a skill is loaded by
+# every later sandbox, so an agent must not be able to plant one unasked.
+if [ "$image" = "$HERMES_IMAGE" ]; then
+    skills_mount=/opt/data/.claude/skills
+else
+    skills_mount=/home/agent/.claude/skills
+fi
+[ -n "$DRY_RUN" ] || mkdir -p "$SKILLS_DIR"
+if [ -n "$write_skills" ]; then
+    run_args+=(-v "$SKILLS_DIR:$skills_mount")
+else
+    run_args+=(-v "$SKILLS_DIR:$skills_mount:ro")
+fi
+
+# Extra folders granted to this project with `agent-sandbox folders add`,
+# mounted at the same paths as on the host.
+extra_writable=""
+extra_listing=""
+claude_settings=""
+while IFS=$'\t' read -r mode path; do
+    case "$mode" in
+        ro) run_args+=(-v "$path:$path:ro") ;;
+        rw)
+            run_args+=(-v "$path:$path")
+            extra_writable="$extra_writable:$path"
+            ;;
+        settings)
+            claude_settings="$path"
+            continue
+            ;;
+    esac
+    extra_listing="$extra_listing$mode"$'\t'"$path"$'\n'
+done < <(project_data mounts ${write_skills:+--allow "$skills_mount"})
+
+# Facts for the note each agent is given about this session (see agents.sh).
+run_args+=(
+    -e "SANDBOX_FOLDERS=$extra_listing"
+    -e "SANDBOX_SKILLS_PATH=$skills_mount"
+    -e "SANDBOX_SKILLS_WRITABLE=$write_skills"
+)
+
+# Claude Code otherwise asks before touching anything outside the project.
+if [ -n "$claude_settings" ]; then
+    case "$sub" in
+        claude | claude-local) cmd=("$sub" --settings "$claude_settings" "$@") ;;
+    esac
+fi
+
+if [ "$image" = "$HERMES_IMAGE" ]; then
+    # The official Hermes image runs its own init, remaps its user to these
+    # ids and then drops root. Its state lives in a volume of its own, apart
+    # from the coding agents' sign-ins.
+    run_args+=(
+        --security-opt no-new-privileges
+        -e "HERMES_UID=$(id -u)"
+        -e "HERMES_GID=$(id -g)"
+        -e "HERMES_CLAUDE_MODEL=$HERMES_CLAUDE_MODEL"
+        # Hermes's file tools only write under these roots.
+        -e "HERMES_WRITE_SAFE_ROOT=/opt/data:$WORKSPACE$extra_writable${write_skills:+:$skills_mount}"
+        -v "$HERMES_VOLUME:/opt/data"
+    )
+    if [ "$sub" = hermes-claude ]; then
+        export ANTHROPIC_API_KEY="$HERMES_ANTHROPIC_API_KEY"
+        run_args+=(-e HERMES_BRAIN=claude -e ANTHROPIC_API_KEY)
+    else
+        run_args+=(-e HERMES_BRAIN=local)
+    fi
+else
+    # Conversation history is kept per project, in the project's folder
+    # under the state folder, so agents in one project cannot read another's
+    # and nothing an agent can write to is ever mounted from. Sign-ins and
+    # settings stay in the home volume.
+    if [ -z "$DRY_RUN" ]; then
+        history="$(project_data prepare)"
+    else
+        history="$(project_data folder)"
+    fi
+    run_args+=(--init -v "$HOME_VOLUME:/home/agent")
+    # Each agent gets only what it needs. The Anthropic sign-in has a volume
+    # of its own, mounted for `claude` alone, so an agent on a local model
+    # cannot read it. History is likewise mounted per agent, so one agent
+    # cannot rewrite the saved conversations or memory notes of another.
+    case "$sub" in
+        claude)
+            run_args+=(
+                -v "$CLAUDE_VOLUME:/home/agent/.claude"
+                -e CLAUDE_CONFIG_DIR=/home/agent/.claude
+                -v "$history/claude:/home/agent/.claude/projects"
+            )
+            ;;
+        claude-local) run_args+=(-v "$history/claude-local:/home/agent/.claude-local/projects") ;;
+        opencode) run_args+=(-v "$history/opencode:/home/agent/.local/share/opencode") ;;
+        oterm)
+            run_args+=(
+                -v "$history/oterm:/home/agent/.local/share/oterm"
+                -e OTERM_DATA_DIR=/home/agent/.local/share/oterm
+            )
+            ;;
+    esac
+fi
+
+# If the project contains these files, the agent must not be able to edit
+# the allowlist, the proxy or the launcher.
+case "$SCRIPT_DIR/" in
+    "$WORKSPACE"/*) run_args+=(-v "$SCRIPT_DIR:$SCRIPT_DIR:ro") ;;
+esac
+
+# Commits made in the sandbox carry your identity without mounting ~/.gitconfig.
+if command -v git >/dev/null 2>&1; then
+    git_name="$(git config --get user.name || true)"
+    git_email="$(git config --get user.email || true)"
+    if [ -n "$git_name" ]; then
+        run_args+=(-e "GIT_AUTHOR_NAME=$git_name" -e "GIT_COMMITTER_NAME=$git_name")
+    fi
+    if [ -n "$git_email" ]; then
+        run_args+=(-e "GIT_AUTHOR_EMAIL=$git_email" -e "GIT_COMMITTER_EMAIL=$git_email")
+    fi
+fi
+
+if [ -t 0 ] && [ -t 1 ]; then
+    run_args+=(-it)
+fi
+
+if [ -n "$DRY_RUN" ]; then
+    printf '%q ' docker "${run_args[@]}" "$image" "${cmd[@]}"
+    echo
+    exit 0
+fi
+
+if [ -n "$write_skills" ]; then
+    echo "agent-sandbox: global skills are writable in this sandbox ($SKILLS_DIR)" >&2
+    skills_before="$STATE_DIR/skills-before-$$.json"
+    project_data skills-snapshot --skills-dir "$SKILLS_DIR" "$skills_before"
+fi
+
+status=0
+docker "${run_args[@]}" "$image" "${cmd[@]}" || status=$?
+if [ -n "$write_skills" ]; then
+    project_data skills-changes --skills-dir "$SKILLS_DIR" "$skills_before" >&2 || true
+fi
+if [ -n "${PROXY_TOKEN:-}" ]; then
+    rm -f "$STATE_DIR/sandboxes/$PROXY_TOKEN"
+fi
+exit "$status"

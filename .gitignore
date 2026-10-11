@@ -1,0 +1,6 @@
+# Local settings with live API keys; copy sandbox.env.example to create it.
+sandbox.env
+
+__pycache__/
+*.pyc
+.DS_Store

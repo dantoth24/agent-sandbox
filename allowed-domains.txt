@@ -1,0 +1,16 @@
+# Domains the sandbox may reach through the approval proxy (ports 443 and 80).
+# The proxy re-reads this file whenever it changes; nothing needs restarting.
+# The approval dialog's allow and block choices append lines here.
+#
+#   example.com                              this exact name
+#   *.example.com                            any subdomain of example.com
+#   example.com until=2026-10-01T15:00:00    allowed until then
+#   !example.com                             always refused, without asking
+
+# Claude Code: Anthropic API
+api.anthropic.com
+
+# Claude Code: sign-in and token refresh. Not needed with an API key.
+claude.ai
+platform.claude.com
+!models.opencode.ai

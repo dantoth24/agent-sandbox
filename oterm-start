@@ -1,0 +1,25 @@
+#!/bin/bash
+# Runs as the agent user. Points oterm at the host model server, then starts
+# it. oterm keeps its config and its chats in one folder, which the launcher
+# mounts from this project's history, so both are per project.
+set -euo pipefail
+
+# shellcheck source=/dev/null
+. /etc/agent-sandbox/model.env
+export MODEL_API_KEY
+
+data="${OTERM_DATA_DIR:-$HOME/.local/share/oterm}"
+config="$data/config.json"
+mkdir -p "$data"
+[ -s "$config" ] || echo '{}' > "$config"
+
+# Only the "local" endpoint is rewritten; a theme, keymap or MCP servers
+# added to the file are kept. The key is referenced, not stored: oterm
+# expands ${MODEL_API_KEY} itself when it reads the file.
+updated="$(mktemp "$data/config.XXXXXX")"
+jq --arg url "http://$MODEL_HOST:$MODEL_PORT/v1" \
+    '.openaiCompatible.local = {base_url: $url, api_key: "${MODEL_API_KEY:-local}"}' \
+    "$config" > "$updated"
+mv "$updated" "$config"
+
+exec oterm "$@"

@@ -1,0 +1,23 @@
+#!/bin/bash
+# Claude Code against the host llama-server (its Anthropic-compatible
+# /v1/messages endpoint) instead of Anthropic's API.
+set -euo pipefail
+
+# Written by the entrypoint. Read from here rather than the environment so
+# the wrapper still works when a parent process has stripped the key.
+# shellcheck source=/dev/null
+. /etc/agent-sandbox/model.env
+
+export ANTHROPIC_BASE_URL="http://${MODEL_HOST}:${MODEL_PORT}"
+export ANTHROPIC_AUTH_TOKEN="${MODEL_API_KEY:-local}"
+export ANTHROPIC_MODEL="$MODEL_NAME"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL_NAME"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL_NAME"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL_NAME"
+export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL_NAME"
+# Claude Code assumes 200k tokens for models it does not know.
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${MODEL_CONTEXT:-131072}"
+# Separate state, so this never clashes with an Anthropic sign-in used by `claude`.
+export CLAUDE_CONFIG_DIR="$HOME/.claude-local"
+
+exec claude "$@"
